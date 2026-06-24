@@ -1,0 +1,6 @@
+opencv-python-headless
+mediapipe==0.10.13
+streamlit
+streamlit-webrtc
+av
+numpy
