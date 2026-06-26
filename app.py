@@ -1,123 +1,68 @@
-import cv2
-import mediapipe as mp
-import numpy as np
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+import cv2
+import numpy as np
 import av
 
-mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
-
-canvas = np.zeros((480, 640, 3), dtype=np.uint8)
-prev_points = {}
-clear_counter = 0
-FINGER_TIPS = [4, 8, 12, 16, 20]
-
-def fingers_up(hand_landmarks, hand_label):
-    lm = hand_landmarks.landmark
-    fingers = []
-    if hand_label == "Right":
-        fingers.append(1 if lm[4].x < lm[3].x else 0)
-    else:
-        fingers.append(1 if lm[4].x > lm[3].x else 0)
-    for tip in FINGER_TIPS[1:]:
-        fingers.append(1 if lm[tip].y < lm[tip - 2].y else 0)
-    return fingers
-
-class HandTracker(VideoProcessorBase):
+class HandDrawer(VideoProcessorBase):
     def __init__(self):
-        self.hands = mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.5
-        )
-        self.canvas = np.zeros((480, 640, 3), dtype=np.uint8)
-        self.prev_points = {}
-        self.clear_counter = 0
+        self.canvas = None
+        self.prev_x = 0
+        self.prev_y = 0
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
         img = cv2.flip(img, 1)
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(rgb)
         fh, fw, _ = img.shape
 
-        if self.canvas.shape[:2] != (fh, fw):
+        if self.canvas is None:
             self.canvas = np.zeros((fh, fw, 3), dtype=np.uint8)
 
         black = np.zeros((fh, fw, 3), dtype=np.uint8)
 
-        if results.multi_hand_landmarks:
-            total_hands = len(results.multi_hand_landmarks)
-            for idx in range(min(total_hands, 2)):
-                hand_lms = results.multi_hand_landmarks[idx]
-                hand_label = results.multi_handedness[idx].classification[0].label
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        lower = np.array([0, 120, 70])
+        upper = np.array([10, 255, 255])
+        mask = cv2.inRange(hsv, lower, upper)
+        mask = cv2.dilate(mask, None, iterations=2)
 
-                if idx not in self.prev_points:
-                    self.prev_points[idx] = (0, 0)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-                mp_draw.draw_landmarks(black, hand_lms, mp_hands.HAND_CONNECTIONS)
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(c) > 1000:
+                M = cv2.moments(c)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
 
-                f = fingers_up(hand_lms, hand_label)
-                total = sum(f)
+                    if self.prev_x == 0 and self.prev_y == 0:
+                        self.prev_x, self.prev_y = cx, cy
 
-                index_tip = hand_lms.landmark[8]
-                cx = int(index_tip.x * fw)
-                cy = int(index_tip.y * fh)
-                px, py = self.prev_points[idx]
-
-                color = (0, 255, 0) if hand_label == "Right" else (255, 100, 0)
-
-                if f[1] == 1 and f[2] == 0 and f[3] == 0 and f[4] == 0:
-                    if px == 0 and py == 0:
-                        self.prev_points[idx] = (cx, cy)
-                    else:
-                        cv2.line(self.canvas, (px, py), (cx, cy), color, 5)
-                        self.prev_points[idx] = (cx, cy)
-                    cv2.circle(black, (cx, cy), 10, color, cv2.FILLED)
-                    cv2.putText(black, f"{hand_label} Drawing...",
-                                (10, 80 + idx * 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-
-                elif f[1] == 1 and f[2] == 1 and f[3] == 0 and f[4] == 0:
-                    self.prev_points[idx] = (0, 0)
-                    cv2.putText(black, f"{hand_label} Paused",
-                                (10, 80 + idx * 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 255), 2)
-
-                elif total >= 4:
-                    self.clear_counter += 1
-                    cv2.putText(black, f"Hold to Clear... {self.clear_counter}",
-                                (10, 80 + idx * 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    if self.clear_counter > 10:
-                        self.canvas = np.zeros((fh, fw, 3), dtype=np.uint8)
-                        self.prev_points = {}
-                        self.clear_counter = 0
-                else:
-                    self.clear_counter = 0
-                    self.prev_points[idx] = (0, 0)
+                    cv2.line(self.canvas, (self.prev_x, self.prev_y), (cx, cy), (0, 255, 0), 5)
+                    self.prev_x, self.prev_y = cx, cy
+                    cv2.circle(black, (cx, cy), 10, (0, 255, 0), cv2.FILLED)
+        else:
+            self.prev_x, self.prev_y = 0, 0
 
         black = cv2.add(black, self.canvas)
 
-        cv2.putText(black, "1 finger=Draw | 2 fingers=Pause | 5 fingers=Clear",
-                    (10, fh - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (150, 150, 150), 1, cv2.LINE_AA)
+        cv2.putText(black, "Show RED object to draw | Q to quit",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (150, 150, 150), 2)
 
         return av.VideoFrame.from_ndarray(black, format="bgr24")
 
-st.set_page_config(page_title="Air Writing", page_icon="✏️")
-st.title("Air Writing - Hand Gesture Drawing")
+st.set_page_config(page_title="Air Drawing", page_icon="✏️")
+st.title("Air Drawing App")
 st.markdown("""
 **How to use:**
-- ☝️ **1 finger** = Draw
-- ✌️ **2 fingers** = Pause
-- 🖐️ **5 fingers** = Clear screen
+- Show a **RED object** (pen cap, red marker) to camera to draw!
+- Move it around to draw on screen
 """)
 
 webrtc_streamer(
-    key="hand-tracking",
-    video_processor_factory=HandTracker,
+    key="hand-drawing",
+    video_processor_factory=HandDrawer,
     media_stream_constraints={"video": True, "audio": False},
 )
